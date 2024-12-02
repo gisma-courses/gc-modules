@@ -1,0 +1,407 @@
+---
+title: 'Change Detection - Auswertung'
+author: Chris Reudenbach
+date: '2022-02-16'
+bibliography: references.bib
+slug: []
+categories:
+  - modules
+tags:
+  - change detection  
+  - remote sensing
+  - forest
+  - validation
+
+subtitle: ''
+description: 'Da in jeder Klassifizierung von Daten immer Fehlklassifikationen vorkommen und die Ursachen vielfältiger Art sein können und häufig nicht bestimmbar sind, ist ist die Bewertung der statistisch ermittelten Klassifikationsqualität von zentraler Bedeutung um die Belastbarkeit der Klassifikation einschätzen zu können. Der nachfolgende Artikel beschäftigt sich mit den grundständigen Auswertungskonzepten.'
+image: '/assets/images/forest-sp.jpg'
+toc: yes
+output:
+  blogdown::html_page:
+    keep_md: yes
+weight: 503
+---
+
+Da in jeder Klassifizierung von Daten immer Fehlklassifikationen vorkommen und die Ursachen vielfältiger Art sein können und häufig nicht bestimmbar sind, ist ist die Bewertung der statistisch ermittelten Klassifikationsqualität von zentraler Bedeutung um die Belastbarkeit der Klassifikation einschätzen zu können. Der nachfolgende Artikel beschäftigt sich mit grundständigen Auswertungskonzepten.
+
+## Setup
+```{r setup,comment = NA, echo=TRUE, message = FALSE, warnings = FALSE, results = FALSE }
+root_folder = "~/edu/geoinfo/"
+
+#
+# Type: script
+# Name: change_detection_workflow.R
+# Description:  basic reproducible Change Detection workflow for Sentinel data
+#               data download -> digitizing training areas ->
+#               extracting and preparing training data ->
+#               example classifications: cluster analysis, random forest, MaxLike
+#               quality assesment and comparison with basic tools, kappa, and motif
+#               basic visualisation examples with tmap and mapview
+# Dependencies:
+# Output: original sentinel tile
+#         AOI window of this tile (research_area)
+#         training areas
+# Copyright: GPL (>= 3), Chris Reudenbach, creuden@gmail.com
+#
+
+#--- laden der notwendigen Bibliotheken
+# Achtung Pakete müssen evtl. manuell installiert werden
+library(envimaR)
+library(remotes)
+
+# SDMTools und RSenal sind für die extended Kappa Berechnung notwendig
+remotes::install_version("SDMTools", version = "1.1-221.2")
+#remotes::install_github("environmentalinformatics-marburg/Rsenal")
+#library(Rsenal)
+
+# Paket zu Mustererkennung
+library(motif)
+
+## setzen des aktuellen Projektverzeichnisses (erstellt mit envimaR) als root_folder
+#root_folder = find_rstudio_root_file()
+root_folder = "~/edu/geoinfo/"
+
+# einlesen des zuvor erstellten Setup-Skripts
+source(file.path(root_folder, "src/functions/000_setup.R"))
+source(file.path(root_folder, "src/functions/fun_helper.R"))
+source(file.path(root_folder, "src/functions/fun_tmap.R"))
+source(file.path(root_folder, "src/functions/fun_kappa.R"))
+```
+
+
+
+
+
+## Einlesen der Datensätze
+In den Beiträgen [Forstflächenverluste im Harz](/gi-modules/post/2021-12-03-r-spatial-in-der-nussschale/) und [Klassifikation von Landuse/Landcover Veränderungen](/gi-modules/post/2021-12-16-change-detection/) sind verschiedene Klassifikationsverfahren angewendet worden. Diese sollen nun sowohl hinsichtlich ihrer Qualität als auch die quantitativen Ähnlichkeiten/Unähnlichkeiten (also die Veränderung) untersucht werden. 
+
+
+
+
+```{r download, echo=TRUE, message = FALSE, warnings = FALSE, results = TRUE }
+
+# Größe des Aggregationsfensters für die Auswertung Distanz-Schwellenwert motif
+# Achtung! "dist" ist abhängig von wins_size. Je kleiner win_size desto größer muss 
+# der Schwellenwert gesetzt werden
+win_size = 25
+
+#--- Laden der Vorhersagekarten aus den vorrausgegangenen Übungen
+train_areas_2019 = readRDS(paste0(envrmt$path_data,"train_areas_2019.rds"))
+train_areas_2020 = readRDS(paste0(envrmt$path_data,"train_areas_2020.rds"))
+
+prediction_rf_2019 = readRDS(paste0(envrmt$path_data,"pred_rf_2019.rds"))
+prediction_rf_2020 = readRDS(paste0(envrmt$path_data,"pred_rf_2020.rds"))
+
+prediction_mlc_2019 = readRDS(paste0(envrmt$path_data,"pred_mlc_2019.rds"))
+prediction_mlc_2020 = readRDS(paste0(envrmt$path_data,"pred_mlc_2020.rds"))
+
+# corine datensatz download
+utils::download.file(url="https://github.com/gisma/gismaData/raw/master/geoinfo/corine.tif",destfile=file.path(envrmt$path_data_lev0,"corine.tif"))
+corine = raster::raster(file.path(envrmt$path_data_lev0,"corine.tif"))
+
+# Erstellen einer Wald-Maske
+# Agro-forestry areas code=22, Broad-leaved forest code=23,
+# Coniferous forest code=24, Mixed forest code=25
+mask = reclassify(corine,c(-100,22,0,22,26,1,26,500,0))
+
+```
+
+
+## Fehlereinschätzung 
+
+Die Bewertung der Genauigkeit von Fernerkundungsklassifizierungen basiert üblicherweise auf der Verwendung einer Fehlermatrix oder Konfusionstabelle, für die Referenzdaten das so genannte "Ground Truthing" benötigt werden. Diese Bewertungen können sowohl qualitativ, d. h. in der Regel durch einen visuellen Vergleich zwischen dem klassifizierten Datensatz und der Situation vor Ort (im Luft-/Satellitenbild) als auch quantitativ durch den Vergleich der klassifizierten Daten untereinander oder mit unabhängigen Referenzdaten erfolgen.
+
+
+Die wichtigsten Fehlerursachen bei Klassifikationen sind:
+
+*  Qualität der Eingangsdaten
+*  die Eignung des Klassifizierungsalgorithmus im Kontext der Trainingsdaten
+*  die generelle Trennbarkeit der auszuweisenden Klassen
+
+Zur Einschätzung ist es notwendig die folgenden Bereiche zu betrachten:
+
+* Gesamtgenauigkeit der Klassifikationskarte (zusammengesetzt aus der Genauigkeit der einzelnen Klassen)
+* Fehlklassifikation je Klasse (inkl. Fehlzuordnung je Klasse)
+
+
+Die Validierungsdaten bzw. der sog *Ground Truth* ist für die Berechnung elementar. Üblich ist es hierzu Punktdaten zu verwenden, komplexer wird es wenn kategoriale, räumlichen Referenzdaten verglichen werden. Der gebräuchlichste Ansatz ist eine Fehlermatrix oder Konfusionstabelle und die auf dieser Grundlage berechneten Kappa-Koeffizienten als grundlegende Kennzahlen der Genauigkeitsbewertung.
+
+
+
+### Berechnung einer Kreuztabelle
+
+Die Berechnung der Qualitätsmaße basiert auf einer Kreuztabelle erstellt aus zwei kategorialen Datensätzen (Karten). Dabei ist die eine Karte in den Zeilen und die andere in den Spalten der Tabelle abgetragen. Die Zeilensummen zeigen den Anteil der Pixel für jede Klasse in Karte A, die Spaltensummen korrespondierend für Karte B. Die Tabelle gibt an, wie viel Prozent der Pixel in beiden Karten übereinstimmen (Diagonale) sowie wie viel Prozent der Pixel in jeder Klasse *nicht* übereinstimmen. In den nachfolgenden Beispielen vergleichen wir die *Random Forest Klassifikation* mit der korrespondierenden *Maximum Likelihood Klassifikation*. Ziel ist es die Vergleichbarkeit beider Klassifikation zu bewerten. Konkret berechnen wir also Metriken, die eine Aussage erlauben wie gut die beiden Klassifikation übreinstimmen. 
+
+```{r Fehlermatrix}
+
+## ---- Change Detection Auswertung ----
+
+# Differenzbild random forest
+tmap_mode("view")
+tmap::qtm(prediction_rf_2020 - prediction_rf_2019,title = "kmeans 2019")
+
+# ---- Extraktion der Klassennamen ----
+categories = levels(prediction_rf_2019)[[1]]$value
+categories
+
+# ---- Berechnung der Konfusionsmatrix  ----
+ct = raster::crosstab(prediction_rf_2019,prediction_mlc_2019$map)
+rownames(ct) = categories
+colnames(ct) = categories
+ct %>%
+  kbl(caption = "Crosstab rf vs mlc (2019)") %>%
+  kable_classic(full_width = F)
+```
+
+
+
+
+
+### Quantitative Qualitätsmessung - Berechung der Kappa Metriken
+
+Vor allem in der Fernerkundung und der räumlichen Analyse kategorialer Daten ist Cohens Kappa Index [@cohen1960] ein beliebtes Maß eine Klassifizierung (Vorhersage) mit einer Referenzkarte (Beobachtung/andersartige Beobachtung) zu vergleichen (vgl.  [@Kappa]). Allgemeiner ausgedrückt: Zwei kategoriale Datensätzen miteinander zu vergleichen. Cohen's Kappa Index vergleicht den Anteil übereinstimmender Pixel zweier Raster mit der erwarteten Übereinstimmung bei zufälliger Pixelanordnung. Die Indexwerte liegen zwischen -1 und 1 wobei ein Indexwert von 0 einem Ergebnis entspricht, das eine zufällige Pixelanordnung beschreibt. 
+
+
+```{r Kreuztabelle, echo=FALSE, message=FALSE, warnings=FALSE}
+tibble(
+  'Kategorie' =     c("Kategorie A","Kategorie B","Summe"),
+  'Kategorie A' = c("$$p_{(1/1)}$$","$$p_{(2/1)}$$","$$pT_A= \\sum_{i=1}^2 p_{1,i}$$"),
+  'Kategorie B' = c("$$p_{(1/2)}$$","$$p_{(2/2)}$$","$$pT_B= \\sum_{i=1}^2 p_{1,i}$$"),
+  'Summe' = c("$$Tp_A= \\sum_{i=1}^2 p_{1,i}$$","$$Tp_B= \\sum_{i=1}^2 p_{1,i}$$","$$1$$"),
+) %>%
+  kbl(caption = "Kreuztabelle") %>% 
+  kable_classic(full_width = T) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+Aus der Kreuztabelle werden $PA$ (Anteil an Übereinstimmung), $PE$ (erwarteter Anteil an Übereinstimmung)  und auf dieser Grundlage Kappa $K$ berechnet.
+
+$$PA= \sum_{i=1}^2 p_{i,i}$$
+
+$$PE= \sum_{i=1}^2 pT_i*Tp_i$$
+
+
+$$K=\frac{PA-PE}{1-PE}$$
+
+
+Die Interpretation der Kappa Metrik ist einfach muss jedoch von den Fragestellungen abhängig interpretiert werden. Wichtig ist es die nicht lineare Aufteilung der Metrik zu beachten. Das gilt insbesondere für Werte < 0.2 und > 0.9. Als Grundlage zur Interpretation wird häufig folgende Skala genutzt (vgl. auch [@Landis&Koch1977];[@Monserud&Leemans1992]).
+
+
+```{r Kappatabelle , echo=FALSE, message=FALSE, warnings=FALSE}
+
+ tibble::tibble( "Kappa" =    "Übereinstimmung",
+  "kleiner 0.05" =  "keine",
+  "0.05 - 0.2" =    "sehr gering",
+  "0.2 - 0.4" =   "gering",
+"0.4 - 0.55" =	"ausreichend",
+"0.55 - 0.7" =	"gut",
+"0.7 - 0.85" =	"sehr gut",
+"0.85 - 0.99"	= "exzellent",
+"0.99 - 1.0"	= "perfekt") %>% 
+  kbl(caption = "Qualitative Interpretation von Cohen's Kappa") %>% 
+  kable_classic(full_width = T) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+Ein Kappa Wert von > 0.99 gilt somit als perfekte Übereinstimmung der beiden Datensätze. Hohe Kappa Werte (> 0.95) sind aber insbesondere bei kategorial klassifizierten Fernerkundungsdaten, die mit einem sehr grossen und häufig über die Klassen ungleich verteilten N einhergehen, extrem unwahrscheinlich und **immer** mit Vorsicht zu betrachten. 
+
+### Kappaberechnung für quantitative und lagebezogene Ähnlichkeiten 
+
+Zur Verbesserung der eher allgemeinen und unter Umständen auch falschen Interpretation von Cohen's Kappa wird von verschiedenen Autoren vorgeschlagen (vgl. [@Pontius2000],[@Hagen2002]) den Kappaindex $K$ in $K_{histo}$ und $K_{location}$ aufzuteilen. Das Produkt aus beiden Werten ergibt $K$ und setzt sich aus der *quantitativen* Ähnlichkeit (Anzahl Pixel) und der Ähnlichkeit in die Lage der jeweiligen Klassen (Pixel am geleichenOrt haben den gleichen Wert) zusammen. Hierzu wird aus der Kreutabelle zusätzlich und $P_{max}$ (maximal erreichbarer Anteil an Übereinstimmung) bestimmt.
+
+$Pmax= \sum_{i=1}^2 min(pT_i,Tp_i)$
+
+$K_{histo}$ und $K_{location}$ können dann folgendermassen bestimmt werden:
+
+$K_{histo}=\frac{Pmax-PE}{1-PE}$
+
+$K_{location}=\frac{PA-PE}{Pmax-PE}$
+
+Folglich ergibt die Multiplikation der beiden Metriken Kappa. 
+
+$K=K_{histo}*K_{location}$
+
+Also gibt  $K_{histo}$ die quantitative Ähnlichkeit von zwei Karten an und wird aus dem Histogramm der einzelnen Kategorien berechnet. Der Index sagt aus, wie gut die Verteilung der Pixel auf die einzelnen Kategorien in beiden Karten übereinstimmt.  $K_{location}$ hingegen gibt die Ähnlichkeit der räumlichen Lage der Kategorien an. Die Ähnlichkeit der Karten wird skaliert auf die maximal erreichbare Ähnlichkeit entsprechend der gegebenen Pixelzahlen der Kategorien.  $K_{location}$ ist daher der Kappaindex der erreicht werden könnte wenn  $K_{histo} = 1$  wäre.
+
+
+### Kappaberechnung der Mengen- (quantity disagreement) und Zuordnungsabweichung (allocation disagreement)
+
+Da auch $K_{histo}$ und  $K_{location}$ nicht optimal für die Abschätzung der  Übereinstimmung von Anzahl und Lage sind (z.B. wenn `Klasse 1 >> Klasse 2` ist), haben (@Pontius_Milliones2011) aus einer Kreuztabelle einfach zu berechnende Metriken die Abweichungs-Metriken *quantity disagreement* (QD) und *allocation disagreement* (QD) entwickelt. Diese Parameter bieten bei simpler Berechnung eine gute Einschätzung der Übereinstimmung von Mengen- und Lagequalität kategorialer Raum-Daten.
+
+Die Disagreement Metriken werden wie folgt berechnet:
+
+$allocation \ disagreement=100*(Pmax-PA)$
+
+$quantity \ disagreement=100*(1-Pmax)$
+
+Im Paket `Rsenal` [@Rsenal] ist die Funktion `kstat()` zur Berechnung der obigen Metriken implementiert (siehe Setup Sektion). Mit ihr ist die Berechnung sämtlicher Kappa-Metriken, auch für multikategoriale Ausprägungen, komfortabel durchführbar.
+
+#### Berechnung für MLC vs RF 2019
+
+```{r Kappa-2019, echo=FALSE, message=FALSE, warnings=FALSE}
+
+# 2019
+kstat(prediction_mlc_2019$map,prediction_rf_2019, perCategory = FALSE)[,c(1:3,7:8)]  %>%
+  kbl(caption = "Kappa 2019 MLC vs RF") %>%
+  kable_classic(full_width = F)
+```
+
+
+#### Berechnung für MLC vs RF 2020
+
+```{r Kappa-2020, echo=FALSE, message=FALSE, warnings=FALSE}
+# 2020
+kstat(prediction_mlc_2020$map,prediction_rf_2020,perCategory = FALSE)[,c(1:3,7:8)]  %>%
+  kbl(caption = "Kappa 2020 MLC vs RF") %>%
+  kable_classic(full_width = F) 
+```
+
+
+## Räumliche Analysen zur Veränderung von kategorialen Änderungen
+
+### Veränderungsraster der Konfusionsmatrix
+Neben den, auf den gesamten Datensatz angewendeten, Kappa Metriken ist jedoch auch die spezifische Betrachtung der konkreten Veränderung des einzelnen Pixels (also des Ortes) von Interesse. 
+Die Klassen der Konfusionsmatrix könnnen in diesem Fall korresponiderend źur Vierfeldtabelle in die vier binären Rastergrids umgewandelt werden. So können z.B. explizit die Klassenwechsel *von* und *zu* dargestellt und analysiert werden. Das nachstehende Snippet identifiziert für jedes Pixel die Kategorie des ersten Bildes als Referenzklasse und analysiert die im zweiten Bild beobachtete Klassenveränderung. Diese werden korrespodierend relassifiziert und als Rasterkarten ausgegeben. 
+
+```{r cross_raster,message=FALSE, warnings=FALSE}
+
+# Erzeugen aller Vergleichsraster der Kontingenztabelle
+# Die lapply funktionen sind integrierte FOR Schleifen die über die Liste der
+# Kategorien die Funktion changefrom() für die Kreuztabelle anwenden
+r = lapply(1:length(categories),
+           function(i){lapply(1:length(categories),
+                              function(j){changefrom(prediction_rf_2019, prediction_rf_2020, i,j)})})
+r
+
+# ---- Visualsierung der Kreuztabellierten Von-Zu-Raster ----
+# Plotten der Raster hierzu werden erneut alle Kategorien einzeln geplottet i
+# und j sind hilfsvariablen um die korrekten Raster Layer ansprechen zu können.
+# t ist eine Hilfvariable um eine Liste für die Ergebnisbilder hochzählen zu
+# können
+tmap_mode("view")
+t=i=j=1 # setze zählvariablen auf 1
+m=list() # erzeuge leere Liste für die Karten
+for(cat1 in categories)  { # für jede Kategorie
+  for(cat2 in categories)  { # mit jeder Kategorie
+    # plotte die Karte
+    m[[t]]  = tm_shape(st_as_stars(r[[i]][[j]])) +
+      tm_raster(col = "layer",palette = "viridis",style = "cat",
+                title = if(cat1==cat2) {
+                  paste("no changes " , unique(cat1,cat2))
+                }
+                else if (cat1!=cat2) {
+                  paste(cat1," -> ",cat2)
+                })
+    # zähle die innere schleife hoch
+    j = j + 1
+    # zähle die ergebnisliste hoch
+    t = t + 1
+  }
+  # innere schleife abgearbeitet setze sie auf  den Anfang zurück
+  j = 1
+  # zähle die äußere Schleife hoch
+  i = i + 1
+}
+
+# Interaktive und synchronisierte Karten
+tmap::tmap_arrange(m,sync = TRUE)
+
+```
+
+
+## Musterbasierte räumliche Analyse der Veränderungen 
+
+Eine aufwendigere, aber insbesondere für multi-spatio-temporale Zeitreihen veilversprechende, Vorgehensweise ist die musterbasierte räumliche Analyse. Grundsätzlich ist die Erfassung der Metriken ähnlich. Die Muster werden auf der Basis unterschiedlich wählbarer Co-Occurrence-Matrizen - auch *räumliche Signaturen* genannt -  auf beliebig festzulegenden räumlichen Aggregationsstufen berechnet. So ist u.a. die Erkennung von Veränderungen und das Zusammenfassung von ähnlichen Gebieten unter Verwendung definierter Wahrscheinlichkeiten einfach umzususetzen.
+
+
+### Analyse der räumlich aggregierten  Veränderungswahrscheinlichkeit 
+
+Sind räumliche Muster nach spezifischen Metriken einander ähnlich kermöglicht dies die Quantifizierung von ihrer zeitlichen Veränderungen. In unserem Beispiel möchten wir vergleichen, wie sich die Landbedeckung im Harz (Klassen: Lichtung/Wald) zwischen 2019 und 2020 verändert hat. Die notwendigen kategorialen Rasterdatensätze m sind unsere Klassifikationsdatensätze von 2019 und 2020 ([Klassifikation von Landuse/Landcover Veränderungen](/gi-modules/post/2021-12-16-change-detection/)). Für den Vergleich nutzen wir nutzen das Paket `motif` [@motif]und hier die die Funktion `lsp_compare()`. Mit dieser Funktion wird ein Co-Occurrence-Vektor  berechnet und als räumlihce Signatur verwendet. Der Jensen-Shannon-Abstand auch als Informations-Radius bekannt misst die Ähnlichkeit der beiden Wahrscheinlichkeitsverteilungen und dient als Ähnlichkeitsmass. Für unser Beispiel haben wir eine räumlihce Aggregation von 25 Zellen im Quadrat (250**m) gewählt.
+ 
+Das Ergebnis ist die Wahrscheinlichkeit einer Veränderungen der Waldbedeckung im Nordwest-Harz für 250*250 Meter Flächen. 
+```{r motif1,message=FALSE, warnings=FALSE}
+
+# ---- Analyse von Veränderungen mit dem paket motif ----
+# lsp_compare vergleicht zwei (oder mehr) kategoriale Karten (change detection
+# klassifikationen etc.) miteinander und nutzt für die Ausgabe der
+# Wahrscheinlichkeiten verschiedener räumlicher Aggregierungsstufen und
+# Merkmalsraum-Distanzen um Veränderungswahrscheinlichkeiten zu ermitteln
+mrf_compare_2020_2019 = lsp_compare(st_as_stars(mask*prediction_rf_2019),
+                                    st_as_stars(mask*prediction_rf_2020),
+                                    type = "cove",
+                                    dist_fun = "jensen-shannon",
+                                    window = win_size,
+                                    threshold = 0.9)
+
+# Visualisierung der Gesamtwahrscheinlichkeiten Achtung logarithmische Skala
+
+palfunc <- function (n, alpha = 1, begin = 0, end = 1, direction = 1) 
+
+mapview::mapView(mrf_compare_2020_2019[4], 
+                 zcol = 'dist', 
+                 layer.name = "jensen-shannon 0.9", 
+                 col.regions = RColorBrewer::brewer.pal(11, "YlOrRd"), 
+                 at = c(0, 0.001, 0.01, 0.1, 1.01),fgb=FALSE)
+
+```
+
+
+### Identifikation der Gebiete maximaler  Veränderungen 
+
+Jetzt interessieren die Gebiete mit maximaler Veränderung. Der erstellte Datensatz wird auf den `dist > 0.1` Wert gefiltert. Schliesslich in eine Rangreihenfolge gebracht. 
+
+```{r motif2, message=FALSE, warnings=FALSE} 
+# ---- Detail-Analyse Teil 1 ----
+# Identifikation der Gebiete (Referenz ist win_size) die maximale Veränderungen
+# aufweisen im Beispiel soll  "dist" soll größer 0.001 sein (logarithmische
+# Skalierung!)
+lc_am_compare_sel = st_as_sf(mrf_compare_2020_2019) %>%
+  subset(dist > 0.01)
+
+# Sortierung nach Größe
+lc_am_compare_sel = lc_am_compare_sel[order(lc_am_compare_sel$dist,decreasing = TRUE), ]
+lc_am_compare_sel
+
+##- Visualsierung
+# Plotten der top ten gebiete wir nutzen die selbst geschriebene Funktion tm_plot()
+# siehe src/functions/fun_tmap.R
+tm_plot(sel=lc_am_compare_sel[1:nrow(lc_am_compare_sel),],vt = "view",ov = T)
+
+```
+
+
+### Visulisierung der Top Veränderungs-Superpixel
+Die so erzeugten *Superpixel* ermöglichen bequem den selektiven Zugriff auf die originale Klassifikation. Die Abbildung zeigt die Entitäten mit den größten Landbedeckungsveränderungen. Diese können recht einfach mit der Funktion `sp_extract()` extrahiert wurden. 
+
+
+```{r motif3, message=FALSE, warnings=FALSE}
+
+# ---- Visualsierng Detail-Analyse ----
+# Extraktion nach der sortierten Liste lc_comapare_sel  werden die top 10 change
+# detection hotspots Daten extrahiert und in die liste lc geschrieben
+lc = lapply(seq(1:10),function(i){
+zz =  lsp_extract(c(st_as_stars(prediction_rf_2019),
+                st_as_stars(prediction_rf_2020)),
+              window = win_size,
+              id = lc_am_compare_sel$id[i])
+})
+
+
+# Erzeugen der top 4 Change Detection Hotspots Karten-Ausschnitte
+mv_lc = lapply(seq(1:4),function(i){
+  leafsync::latticeView(c(mapview(lc[[i]][1],layer.name= "2019") ,mapview(lc[[i]][2],layer.name="2020")) ,sync.cursor = TRUE, sync = "all",ncol = 2)
+})
+
+# plotten der erzeugten Karten
+leafsync::latticeView(mv_lc,ncol = 1)
+
+#####
+
+```
+
+
+
+# References
+
+
