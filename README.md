@@ -1,1 +1,1 @@
-# EON Summer School 2024
+# gc-modules
